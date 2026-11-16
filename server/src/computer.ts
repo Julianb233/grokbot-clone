@@ -1,7 +1,7 @@
 import { db, now } from './db.js';
 import { env } from './env.js';
 import { hub } from './lib/hub.js';
-import { orgo, OrgoError } from './orgo.js';
+import { compute, ComputeError } from './compute/index.js';
 import { getLive } from './store.js';
 import type { ComputerState } from './types.js';
 
@@ -11,7 +11,7 @@ import type { ComputerState } from './types.js';
  * are leased least-recently-used.
  */
 
-const MAX_SCREENS = 4;
+const MAX_SCREENS = Math.max(1, compute.capabilities.maxScreens);
 const inflight = new Map<string, Promise<string>>();
 
 function rowFor(userId: string) {
@@ -37,9 +37,8 @@ export function computerState(userId: string): ComputerState {
 let workspaceId = env.orgoWorkspaceId;
 async function ensureWorkspace(): Promise<string> {
   if (workspaceId) return workspaceId;
-  const ws = await orgo.workspaces();
-  const list = Array.isArray(ws) ? ws : ws.workspaces ?? ws.projects ?? [];
-  if (!list.length) throw new Error('No Orgo workspace available for this key');
+  const list = await compute.workspaces();
+  if (!list.length) return ''; // provider has no workspaces, or none yet: let createComputer decide
   workspaceId = list[0].id;
   (env as any).orgoWorkspaceId = workspaceId;
   return workspaceId;
@@ -69,13 +68,13 @@ export function ensureComputer(userId: string): Promise<string> {
         setStatus(userId, 'creating');
         const user = db.prepare('SELECT email FROM users WHERE id=?').get(userId) as any;
         const name = `grokbot-${(user?.email ?? userId).split('@')[0].replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 30)}-${userId.slice(-6)}`;
-        const c = await orgo.createComputer(name, `grokbot-box-${userId}`);
+        const c = await compute.createComputer({ name, idempotencyKey: `grokbot-box-${userId}`, workspaceId: workspaceId || undefined });
         setStatus(userId, mapStatus(c.status), { orgoId: c.id });
         await prepareBox(c.id);
         setStatus(userId, 'running', { orgoId: c.id });
         return c.id;
       }
-      const c = await orgo.getComputer(r.orgo_id);
+      const c = await compute.getComputer(r.orgo_id);
       if (c.status === 'running') {
         if (r.status !== 'running') setStatus(userId, 'running');
         return c.id;
@@ -85,13 +84,13 @@ export function ensureComputer(userId: string): Promise<string> {
         console.log(`[computer] resume user=${userId} computer=${c.id} (was ${c.status}${c.asleep ? `, asleep in ${c.asleep.where}` : ''})`);
         setStatus(userId, 'resuming');
         // Let an in-flight suspend settle first; resuming mid-suspend can be rejected.
-        for (let i = 0; i < 40 && (await orgo.getComputer(c.id)).status === 'suspending'; i++) await new Promise((res) => setTimeout(res, 3000));
-        await orgo.resume(c.id);
+        for (let i = 0; i < 40 && (await compute.getComputer(c.id)).status === 'suspending'; i++) await new Promise((res) => setTimeout(res, 3000));
+        await compute.resume(c.id);
         await waitRunning(c.id);
         console.log(`[computer] resumed user=${userId} in ${Math.round((Date.now() - t0) / 1000)}s`);
       } else if (c.status === 'frozen' || c.status === 'stopped' || c.status === 'error') {
         setStatus(userId, 'starting');
-        await orgo.start(c.id);
+        await compute.start(c.id);
         await waitRunning(c.id);
       } else {
         setStatus(userId, mapStatus(c.status));
@@ -100,7 +99,7 @@ export function ensureComputer(userId: string): Promise<string> {
       setStatus(userId, 'running');
       return c.id;
     } catch (e: any) {
-      if (e instanceof OrgoError && e.status === 404) {
+      if (e instanceof ComputeError && e.status === 404) {
         // Computer was deleted out from under us: forget it so the next call recreates it.
         db.prepare("UPDATE computers SET orgo_id=NULL, status='absent' WHERE user_id=?").run(userId);
         db.prepare('DELETE FROM screens WHERE user_id=?').run(userId);
@@ -118,7 +117,7 @@ export function ensureComputer(userId: string): Promise<string> {
 async function waitRunning(id: string, timeoutMs = 240_000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
-    const c = await orgo.getComputer(id);
+    const c = await compute.getComputer(id);
     if (c.status === 'running') return;
     await new Promise((r) => setTimeout(r, 3000));
   }
@@ -128,7 +127,7 @@ async function waitRunning(id: string, timeoutMs = 240_000) {
 /** First-boot setup: a profile dir for per-bot Chrome sessions. */
 async function prepareBox(id: string) {
   try {
-    await orgo.bash(id, undefined, 'mkdir -p /root/grokbot/profiles /root/grokbot/files && (which google-chrome || which chromium || which chromium-browser || which firefox) 2>/dev/null', 60);
+    await compute.bash(id, undefined, 'mkdir -p /root/grokbot/profiles /root/grokbot/files && (which google-chrome || which chromium || which chromium-browser || which firefox) 2>/dev/null', 60);
   } catch { /* non-fatal */ }
 }
 
@@ -138,12 +137,18 @@ export async function screenFor(userId: string, botId: string): Promise<{ comput
   const mine = db.prepare('SELECT screen_id FROM screens WHERE bot_id=?').get(botId) as any;
   if (mine) {
     try {
-      await orgo.getScreen(computerId, mine.screen_id);
+      await compute.getScreen(computerId, mine.screen_id);
       db.prepare('UPDATE screens SET last_used_at=? WHERE bot_id=?').run(now(), botId);
       return { computerId, screenId: mine.screen_id };
     } catch {
       db.prepare('DELETE FROM screens WHERE bot_id=?').run(botId);
     }
+  }
+  if (MAX_SCREENS === 1) {
+    // Provider without extra screens: every bot of this user shares the one desktop.
+    db.prepare('INSERT OR REPLACE INTO screens(bot_id,user_id,screen_id,last_used_at) VALUES (?,?,?,?)').run(botId, userId, 'default', now());
+    hub.emit(userId, { type: 'computer', state: computerState(userId) });
+    return { computerId, screenId: 'default' };
   }
   // Primary bot uses the box's default screen.
   const bot = db.prepare('SELECT is_primary FROM bots WHERE id=?').get(botId) as any;
@@ -152,17 +157,17 @@ export async function screenFor(userId: string, botId: string): Promise<{ comput
   let screenId: string | null = null;
   if (bot?.is_primary && !taken.has('default')) screenId = 'default';
   if (!screenId) {
-    const existing = await orgo.listScreens(computerId);
+    const existing = await compute.listScreens(computerId);
     const free = existing.find((s) => !taken.has(s.id) && (s.id !== 'default' || !leased.length));
     if (free) screenId = free.id;
-    else if (existing.length < MAX_SCREENS) screenId = (await orgo.createScreen(computerId)).id;
+    else if (existing.length < MAX_SCREENS) screenId = (await compute.createScreen(computerId)).id;
     else {
       // Evict the least-recently-used idle bot's lease (never one mid-turn), and close its browser
       // so the next bot doesn't inherit another bot's windows. Its Chrome profile stays on disk.
       const victim = leased.find((l) => !getLive(l.bot_id).isRunning && l.screen_id !== 'default') ?? leased.find((l) => l.screen_id !== 'default') ?? leased[0];
       db.prepare('DELETE FROM screens WHERE bot_id=?').run(victim.bot_id);
       screenId = victim.screen_id;
-      try { await orgo.bash(computerId, screenId!, `pkill -f "user-data-dir=/root/grokbot/profiles/${victim.bot_id}" || true`, 20); } catch { /* best effort */ }
+      try { await compute.bash(computerId, screenId!, `pkill -f "user-data-dir=/root/grokbot/profiles/${victim.bot_id}" || true`, 20); } catch { /* best effort */ }
     }
   }
   db.prepare('INSERT OR REPLACE INTO screens(bot_id,user_id,screen_id,last_used_at) VALUES (?,?,?,?)').run(botId, userId, screenId, now());
@@ -178,7 +183,7 @@ async function prepareScreen(computerId: string, screenId: string) {
     // xfwm4's compositor paints over the root window, so run a desktop (wallpaper) on this display.
     // xfdesktop is single-instance per D-Bus session, hence a private session per screen.
     const pid = `/tmp/grokbot-desktop-${display.slice(1)}.pid`;
-    await orgo.bash(
+    await compute.bash(
       computerId,
       screenId,
       `export DISPLAY=${display}; if [ -f ${pid} ] && kill -0 $(cat ${pid}) 2>/dev/null; then echo running; else ` +
@@ -196,10 +201,14 @@ export function suspendComputer(userId: string, reason = 'manual'): Promise<void
   const p = (async () => {
     const r = rowFor(userId);
     if (!r.orgo_id) return;
+    if (!compute.capabilities.suspend) {
+      console.log(`[computer] ${compute.name} cannot suspend; leaving computer=${r.orgo_id} running`);
+      return;
+    }
     console.log(`[computer] suspend user=${userId} computer=${r.orgo_id} reason=${reason}`);
     setStatus(userId, 'suspending');
     try {
-      await orgo.suspend(r.orgo_id);
+      await compute.suspend(r.orgo_id);
       setStatus(userId, 'suspended');
       console.log(`[computer] suspended user=${userId}`);
     } catch (e: any) {
@@ -218,11 +227,11 @@ export async function refreshComputer(userId: string): Promise<ComputerState> {
   const r = rowFor(userId);
   if (r.orgo_id) {
     try {
-      const c = await orgo.getComputer(r.orgo_id);
+      const c = await compute.getComputer(r.orgo_id);
       const s = mapStatus(c.asleep ? 'suspended' : c.status);
       if (s !== r.status) setStatus(userId, s);
     } catch (e: any) {
-      if (e instanceof OrgoError && e.status === 404) {
+      if (e instanceof ComputeError && e.status === 404) {
         db.prepare("UPDATE computers SET orgo_id=NULL, status='absent' WHERE user_id=?").run(userId);
         db.prepare('DELETE FROM screens WHERE user_id=?').run(userId);
       }
