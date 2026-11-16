@@ -1,7 +1,7 @@
 import { db, now } from '../db.js';
 import { newId } from '../lib/ids.js';
 import { hub } from '../lib/hub.js';
-import { orgo } from '../orgo.js';
+import { compute } from '../compute/index.js';
 import { screenFor } from '../computer.js';
 import { appendRow, getBotRow, listRoutines, toRoutine, describeCron } from '../store.js';
 import { executeComposio, innerToolSlugs, isReadOnlySlug, toolkitInfo } from '../composio.js';
@@ -44,7 +44,7 @@ const obj = (properties: Record<string, unknown>, required: string[] = []) => ({
 async function shot(ctx: ToolCtx, caption: string): Promise<ToolResult> {
   const { computerId, screenId } = await screenFor(ctx.userId, ctx.botId);
   await new Promise((r) => setTimeout(r, 700));
-  const s = await orgo.screenshot(computerId, screenId);
+  const s = await compute.screenshot(computerId, screenId);
   const mime = s.mime_type ?? 'image/png';
   const url = s.image.startsWith('data:') ? s.image : `data:${mime};base64,${s.image}`;
   return {
@@ -81,7 +81,7 @@ export const TOOLS: ToolDef[] = [
     activity: 'on_its_computer',
     label: 'Clicking on screen',
     impl: async (a, ctx) => {
-      await onScreen(ctx, (c, s) => orgo.click(c, s, { x: a.x, y: a.y, button: a.button ?? 'left', double: !!a.double }));
+      await onScreen(ctx, (c, s) => compute.click(c, s, { x: a.x, y: a.y, button: a.button ?? 'left', double: !!a.double }));
       return shot(ctx, `Clicked (${a.x}, ${a.y}).`);
     },
   },
@@ -93,7 +93,7 @@ export const TOOLS: ToolDef[] = [
     label: 'Typing',
     impl: async (a, ctx) => {
       const text = String(a.text);
-      for (let i = 0; i < text.length; i += 1500) await onScreen(ctx, (c, s) => orgo.type(c, s, text.slice(i, i + 1500)));
+      for (let i = 0; i < text.length; i += 1500) await onScreen(ctx, (c, s) => compute.type(c, s, text.slice(i, i + 1500)));
       return shot(ctx, `Typed ${text.length} characters.`);
     },
   },
@@ -105,7 +105,7 @@ export const TOOLS: ToolDef[] = [
     label: 'Pressing keys',
     impl: async (a, ctx) => {
       const keys = String(a.keys).split('+').map((k) => (k.length === 1 ? k.toLowerCase() : k)).join('+');
-      await onScreen(ctx, (c, s) => orgo.key(c, s, keys));
+      await onScreen(ctx, (c, s) => compute.key(c, s, keys));
       return shot(ctx, `Pressed ${keys}.`);
     },
   },
@@ -116,7 +116,7 @@ export const TOOLS: ToolDef[] = [
     activity: 'on_its_computer',
     label: 'Scrolling',
     impl: async (a, ctx) => {
-      await onScreen(ctx, (c, s) => orgo.scroll(c, s, { x: a.x, y: a.y, direction: a.direction, amount: a.amount ?? 3 }));
+      await onScreen(ctx, (c, s) => compute.scroll(c, s, { x: a.x, y: a.y, direction: a.direction, amount: a.amount ?? 3 }));
       return shot(ctx, `Scrolled ${a.direction}.`);
     },
   },
@@ -127,7 +127,7 @@ export const TOOLS: ToolDef[] = [
     activity: 'on_its_computer',
     label: 'Dragging',
     impl: async (a, ctx) => {
-      await onScreen(ctx, (c, s) => orgo.drag(c, s, a));
+      await onScreen(ctx, (c, s) => compute.drag(c, s, a));
       return shot(ctx, 'Dragged.');
     },
   },
@@ -143,7 +143,7 @@ export const TOOLS: ToolDef[] = [
         const display = s === 'default' ? ':99' : `:${s.replace('screen-', '')}`;
         const profile = `/root/grokbot/profiles/${ctx.botId}`;
         // Reuse the bot's running Chrome if present (opens a new tab), else start one detached.
-        return orgo.bash(
+        return compute.bash(
           c,
           s,
           `export DISPLAY=${display}; mkdir -p ${profile}; pgrep -f "user-data-dir=${profile}" >/dev/null || rm -f ${profile}/Singleton*; ` +
@@ -167,9 +167,9 @@ export const TOOLS: ToolDef[] = [
       const b64 = Buffer.from(String(a.content), 'utf8').toString('base64');
       // Chunk the base64 so very large files don't exceed a single command's size.
       await onScreen(ctx, async (c, s) => {
-        await orgo.bash(c, s, `mkdir -p ${dir} && : > ${dir}/${name}.b64`, 30);
-        for (let i = 0; i < b64.length; i += 60000) await orgo.bash(c, s, `printf '%s' '${b64.slice(i, i + 60000)}' >> ${dir}/${name}.b64`, 30);
-        return orgo.bash(c, s, `base64 -d ${dir}/${name}.b64 > ${dir}/${name} && rm ${dir}/${name}.b64 && wc -c ${dir}/${name}`, 30);
+        await compute.bash(c, s, `mkdir -p ${dir} && : > ${dir}/${name}.b64`, 30);
+        for (let i = 0; i < b64.length; i += 60000) await compute.bash(c, s, `printf '%s' '${b64.slice(i, i + 60000)}' >> ${dir}/${name}.b64`, 30);
+        return compute.bash(c, s, `base64 -d ${dir}/${name}.b64 > ${dir}/${name} && rm ${dir}/${name}.b64 && wc -c ${dir}/${name}`, 30);
       });
       return { output: JSON.stringify({ ok: true, path: `${dir}/${name}` }), summary: `Saved ${name}` };
     },
@@ -181,7 +181,7 @@ export const TOOLS: ToolDef[] = [
     activity: 'running_commands',
     label: 'Running commands',
     impl: async (a, ctx) => {
-      const r = await onScreen(ctx, (c, s) => orgo.bash(c, s, String(a.command), Math.min(Math.max(a.timeout_seconds ?? 120, 1), 290)));
+      const r = await onScreen(ctx, (c, s) => compute.bash(c, s, String(a.command), Math.min(Math.max(a.timeout_seconds ?? 120, 1), 290)));
       const out = (r.output ?? '').slice(-20000);
       return { output: JSON.stringify({ exit_code: r.exit_code, output: out }), summary: `exit ${r.exit_code}` };
     },

@@ -54,6 +54,7 @@ Fill in these values in `.env`:
 | --- | --- |
 | `XAI_API_KEY` | Grok text and voice API access |
 | `COMPOSIO_API_KEY` | App connections, tool catalog, and Google sign-in |
+| `COMPUTE_PROVIDER` | Which service Bot computers run on. Default `orgo`. See [computer providers](docs/compute-providers.md) |
 | `ORGO_API_KEY` | Cloud computer access |
 | `ORGO_WORKSPACE_ID` | Workspace in which to create computers |
 | `SESSION_SECRET` | Secret used to sign sessions |

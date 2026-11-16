@@ -4,6 +4,8 @@ function req(name: string): string {
   return v;
 }
 
+const computeProvider = (process.env.COMPUTE_PROVIDER ?? 'orgo').trim().toLowerCase();
+
 export const env = {
   port: Number(process.env.PORT ?? 8787),
   appUrl: process.env.APP_URL ?? 'http://localhost:5173',
@@ -12,7 +14,12 @@ export const env = {
   xaiKey: req('XAI_API_KEY'),
   xaiModel: process.env.XAI_MODEL ?? 'grok-4.7',
   composioKey: req('COMPOSIO_API_KEY'),
-  orgoKey: req('ORGO_API_KEY'),
+  /** Which service Bot computers run on. See server/src/compute/providers.ts. */
+  computeProvider,
+  orgoKey: computeProvider === 'orgo' ? req('ORGO_API_KEY') : process.env.ORGO_API_KEY ?? '',
+  /** Override to use an Orgo-compatible API other than orgo.ai. */
+  orgoBaseUrl: process.env.ORGO_BASE_URL ?? '',
+  orgoWsBaseUrl: process.env.ORGO_WS_BASE_URL ?? '',
   /** Orgo workspace that holds every user's box. */
   orgoWorkspaceId: process.env.ORGO_WORKSPACE_ID ?? '',
   /** Orgo box size for new users. */
